@@ -9,109 +9,136 @@ MNT_SYS="$WORK_DIR/mnt_system"
 
 mkdir -p "$OUT_DIR" "$MNT_SYS"
 
-echo "=== GSI ADAPTER STARTED ==="
+echo "=== GSI ADAPTER (POCO F3 SUPER EDITION) STARTED ==="
 
-# 1. Обработка System Image (GSI)
+# 1. ОБРАБОТКА SYSTEM (GSI)
 SYS_IMG="$GSI_DIR/system.img"
-
 if [ ! -f "$SYS_IMG" ]; then
-    echo "❌ System image not found!"
+    echo "❌ Error: System image not found!"
     exit 1
 fi
 
 echo "Processing System Image..."
-# Если образ sparse, разжимаем в raw для монтирования
+# Если GSI сжат в sparse (android format), разжимаем для монтирования
 if file "$SYS_IMG" | grep -q "sparse"; then
     simg2img "$SYS_IMG" "${SYS_IMG}.raw"
     mv "${SYS_IMG}.raw" "$SYS_IMG"
 fi
 
-# Увеличиваем размер образа для внесения правок (+200МБ)
+# Расширяем образ (Poco F3 system раздел в super довольно большой, даем запас)
 e2fsck -f -y "$SYS_IMG" || true
 resize2fs "$SYS_IMG" 4G || true
 
-echo "Mounting GSI..."
+echo "Mounting System..."
 sudo mount -t ext4 -o rw,loop "$SYS_IMG" "$MNT_SYS"
 
-# --- ЗОНА ПРАВОК GSI ---
-
-echo "🔧 Patching Build.prop (Spoofing)..."
-# Подменяем пропсы, чтобы система думала, что она работает на Pixel (для Google Photos) 
-# или на Alioth (для правильного определения железа)
-PROP_FILES=("$MNT_SYS/system/build.prop" "$MNT_SYS/build.prop" "$MNT_SYS/system/phh/prop")
-
-for prop in "${PROP_FILES[@]}"; do
+# --- ПРАВКИ ---
+echo "🔧 Patching Props..."
+for prop in "$MNT_SYS/system/build.prop" "$MNT_SYS/build.prop"; do
     if [ -f "$prop" ]; then
-        # Делаем систему "официальной"
-        sudo sed -i 's/ro.build.type=.*/ro.build.type=user/' "$prop"
-        sudo sed -i 's/ro.build.tags=.*/ro.build.tags=release-keys/' "$prop"
-        # Отключаем Secure flag для работы ADB
+        # Важно для Super раздела: разрешаем логические разделы
+        sudo sed -i 's/ro.boot.dynamic_partitions=.*/ro.boot.dynamic_partitions=true/' "$prop"
+        # Фиксы безопасности
         sudo sed -i 's/ro.secure=1/ro.secure=0/' "$prop"
         sudo sed -i 's/ro.adb.secure=1/ro.adb.secure=0/' "$prop"
-        echo "Patched $prop"
     fi
 done
 
-echo "🔧 Ensuring Permissive Init..."
-# GSI часто не грузятся, если Vendor требует специфичных прав.
-# Создаем скрипт в init.d (если поддерживается) или правим rc
-# Но самый надежный способ для GSI - это не system, а boot.img (CMDLINE).
-# Здесь мы просто пытаемся отключить system-side проверки.
+# Удаляем recovery-from-boot, чтобы не затереть TWRP
 sudo rm -f "$MNT_SYS/system/recovery-from-boot.p"
-
-# --- ФИКС ДЛЯ POCO F3 (OVERLAYS) ---
-# Для GSI на Alioth критичны скругления и статусбар.
-# Проверяем, есть ли папка phh (обычно есть в GSI)
-if [ -d "$MNT_SYS/system/phh" ]; then
-    echo "PHH directory found, activating Alioth specific tweaks if available..."
-    # В GSI от PHH/TrebleDroid настройки часто уже внутри,
-    # но можно положить свой overlay apk в /system/product/overlay/
-fi
-
-# -----------------------
 
 echo "Unmounting System..."
 sudo umount "$MNT_SYS"
 
-# Сжимаем обратно в Sparse для уменьшения размера ZIP
-echo "Sparsing System..."
+echo "Optimizing System Image (Sparse)..."
 img2simg "$SYS_IMG" "$OUT_DIR/system.img"
 
-# 2. Копирование файлов от BASE
+
+# 2. КОПИРОВАНИЕ ФАЙЛОВ ОТ BASE (ИЗ SUPER РАЗДЕЛА)
 echo "Copying Base files..."
-cp "$BASE_DIR/boot.img" "$OUT_DIR/" 2>/dev/null || echo "⚠️ Warning: boot.img not found"
-cp "$BASE_DIR/vendor.img" "$OUT_DIR/" 2>/dev/null || echo "⚠️ Warning: vendor.img not found"
-cp "$BASE_DIR/dtbo.img" "$OUT_DIR/" 2>/dev/null || true
-cp "$BASE_DIR/vbmeta.img" "$OUT_DIR/" 2>/dev/null || true
 
-# 3. Создание структуры для прошивки
-# Вариант 1: Fastboot Images (проще и надежнее)
-# Вариант 2: Recovery ZIP (нужен updater-script)
+# Boot и Vbmeta шьются в физические разделы
+cp "$BASE_DIR/boot.img" "$OUT_DIR/" 2>/dev/null || echo "⚠️ boot.img missing"
+cp "$BASE_DIR/vbmeta.img" "$OUT_DIR/" 2>/dev/null || echo "⚠️ vbmeta.img missing"
+cp "$BASE_DIR/dtbo.img" "$OUT_DIR/" 2>/dev/null || echo "⚠️ dtbo.img missing"
 
-echo "Creating flashing script (Fastboot)..."
-# Создаем батник/sh для удобной установки пользователем
-cat <<EOF > "$OUT_DIR/flash_rom.sh"
-#!/bin/bash
-echo "Flashing POCO F3 Port..."
-fastboot flash boot boot.img
-fastboot flash dtbo dtbo.img
-fastboot flash vbmeta vbmeta.img
-fastboot flash vendor vendor.img
-fastboot flash system system.img
-echo "Wiping userdata is recommended!"
-echo "Done."
-EOF
+# Vendor, Product, Odm - это ЛОГИЧЕСКИЕ разделы внутри Super
+# Мы берем их готовыми от базы
+cp "$BASE_DIR/vendor.img" "$OUT_DIR/" 2>/dev/null || echo "⚠️ vendor.img missing"
+# Если в базе есть product или odm, копируем их тоже (в MIUI они есть)
+cp "$BASE_DIR/product.img" "$OUT_DIR/" 2>/dev/null || true
+cp "$BASE_DIR/odm.img" "$OUT_DIR/" 2>/dev/null || true
 
+
+# 3. ГЕНЕРАЦИЯ СКРИПТА ПРОШИВКИ (ДЛЯ SUPER PARTITION)
+echo "Creating FastbootD flashing scripts..."
+
+# --- WINDOWS (.bat) ---
 cat <<EOF > "$OUT_DIR/flash_rom.bat"
 @echo off
-echo Flashing POCO F3 Port...
+echo ==============================================
+echo      POCO F3 (Alioth) Automated Flasher
+echo      For Dynamic Partitions (Super)
+echo ==============================================
+pause
+
+echo 1. Flashing Physical Partitions (Bootloader mode)...
 fastboot flash boot boot.img
 fastboot flash dtbo dtbo.img
-fastboot flash vbmeta vbmeta.img
+fastboot flash vbmeta vbmeta.img --disable-verity --disable-verification
+
+echo.
+echo 2. Rebooting into FASTBOOTD (Userspace) for Super partitions...
+echo Please wait, the screen will change...
+fastboot reboot fastboot
+timeout /t 10
+
+echo.
+echo 3. Flashing Logical Partitions to Super...
+echo Flashing Vendor...
 fastboot flash vendor vendor.img
+echo Flashing System...
 fastboot flash system system.img
-echo Done. Format Data recommended.
+
+if exist product.img (
+    echo Flashing Product...
+    fastboot flash product product.img
+)
+if exist odm.img (
+    echo Flashing ODM...
+    fastboot flash odm odm.img
+)
+
+echo.
+echo 4. Rebooting to System...
+fastboot reboot
+echo Done. If bootloop -> Format Data in Recovery.
 pause
 EOF
 
+# --- LINUX/MAC (.sh) ---
+cat <<EOF > "$OUT_DIR/flash_rom.sh"
+#!/bin/bash
+echo "=== POCO F3 Flasher (FastbootD) ==="
+
+echo "[1/4] Flashing Physical partitions..."
+fastboot flash boot boot.img
+fastboot flash dtbo dtbo.img
+fastboot flash vbmeta vbmeta.img --disable-verity --disable-verification
+
+echo "[2/4] Rebooting to FASTBOOTD..."
+fastboot reboot fastboot
+sleep 8
+
+echo "[3/4] Flashing Logical partitions (Super)..."
+fastboot flash vendor vendor.img
+fastboot flash system system.img
+[ -f product.img ] && fastboot flash product product.img
+[ -f odm.img ] && fastboot flash odm odm.img
+
+echo "[4/4] Rebooting..."
+fastboot reboot
+EOF
+
+chmod +x "$OUT_DIR/flash_rom.sh"
 echo "=== ADAPTER FINISHED ==="
