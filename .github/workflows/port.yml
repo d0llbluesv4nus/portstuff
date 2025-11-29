@@ -1,4 +1,4 @@
-name: Ultimate POCO F3 Porter
+name: Ultimate POCO F3 Porter (Fixed)
 
 on:
   workflow_dispatch:
@@ -24,11 +24,19 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
-      - name: 🗑️ Maximize Disk Space
-        uses: rokibhasanio/tarater@v1
-        with:
-          free_swap: true
-          free_root: true
+      # --- ИСПРАВЛЕННЫЙ ШАГ ОЧИСТКИ ---
+      - name: 🗑️ Free Disk Space (Manual)
+        run: |
+          echo "Freeing up disk space..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo rm -rf /etc/mysql /etc/php
+          echo "Disk space after cleanup:"
+          df -h
+      # -------------------------------
           
       - name: ⚙️ Install Modding Tools
         run: |
@@ -59,7 +67,6 @@ jobs:
           if [ -f "src_tmp/payload.bin" ]; then
             payload-dumper-go -o workspace/source src_tmp/payload.bin
           else
-            # Если образы лежат просто так или в папке images
             find src_tmp -name "*.img" -exec mv {} workspace/source/ \;
           fi
           rm -rf src_tmp
@@ -77,9 +84,14 @@ jobs:
 
       - name: 🛠️ Run Deep Porting Logic
         run: |
-          chmod +x porting_logic.sh
-          # Запуск скрипта с правами суперпользователя для монтирования
-          sudo ./porting_logic.sh "$(pwd)/workspace/source" "$(pwd)/workspace/base"
+          # Убедимся, что скрипт существует и имеет права
+          if [ -f "porting_logic.sh" ]; then
+            chmod +x porting_logic.sh
+            sudo ./porting_logic.sh "$(pwd)/workspace/source" "$(pwd)/workspace/base"
+          else
+            echo "❌ Error: porting_logic.sh not found in repository!"
+            exit 1
+          fi
 
       - name: 🗜️ Zip & Upload
         run: |
