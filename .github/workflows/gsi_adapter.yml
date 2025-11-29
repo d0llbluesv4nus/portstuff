@@ -1,4 +1,4 @@
-name: GSI Adapter for POCO F3 (Final)
+name: GSI Adapter for POCO F3 (Fixed Permissions)
 
 on:
   workflow_dispatch:
@@ -24,24 +24,18 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
-      - name: 🗑️ Disk Cleanup (Manual)
+      - name: 🗑️ Disk Cleanup
         run: |
-          # Ручная очистка, так как сторонние actions могут быть удалены
-          echo "Cleaning up disk space..."
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          # Ручная очистка места
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
-          echo "Disk space available:"
-          df -h
 
       - name: ⚙️ Install Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y git zip unzip curl wget xz-utils android-sdk-libsparse-utils e2fsprogs f2fs-tools
           
-          # Установка payload-dumper-go
+          # Payload Dumper
           wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
           tar -zxf payload-dumper-go_1.2.2_linux_amd64.tar.gz
           sudo mv payload-dumper-go /usr/local/bin/
@@ -56,7 +50,6 @@ jobs:
           wget -q -O gsi_archive "${{ inputs.gsi_url }}"
           
           echo "Extracting GSI..."
-          # Обработка разных форматов архивов
           if [[ "${{ inputs.gsi_url }}" == *.xz ]]; then
             xz -d -c gsi_archive > workspace/gsi/system.img
           elif [[ "${{ inputs.gsi_url }}" == *.gz ]]; then
@@ -75,11 +68,11 @@ jobs:
           unzip -q base.zip -d base_tmp
           rm base.zip
           
-          # Извлекаем Vendor и Boot
+          # Пытаемся достать vendor/boot
           if [ -f "base_tmp/payload.bin" ]; then
             payload-dumper-go -p vendor,boot,dtbo,vbmeta -o workspace/base base_tmp/payload.bin
           else
-            # Если это Fastboot ROM (img файлы лежат в папке)
+            # Ищем файлы рекурсивно, если они в подпапках
             find base_tmp -name "vendor.img" -exec mv {} workspace/base/ \;
             find base_tmp -name "boot.img" -exec mv {} workspace/base/ \;
             find base_tmp -name "dtbo.img" -exec mv {} workspace/base/ \;
@@ -89,24 +82,24 @@ jobs:
 
       - name: 🛠️ Run Adapter Script
         run: |
-          # Проверка наличия скрипта
           if [ ! -f "adapter.sh" ]; then
-            echo "❌ Error: adapter.sh not found! Please create it in the repo."
+            echo "❌ Error: adapter.sh is missing!"
             exit 1
           fi
-          
           chmod +x adapter.sh
-          # Запуск от root (создает файлы с правами root)
+          # Запуск скрипта от ROOT (что вызывает проблему прав)
           sudo ./adapter.sh "$(pwd)/workspace/gsi" "$(pwd)/workspace/base"
 
-      - name: 🗜️ Pack & Release (Fixed Permissions)
+      - name: 🗜️ Pack & Release (FIXED)
         run: |
           echo "Fixing permissions..."
-          # ВАЖНОЕ ИСПРАВЛЕНИЕ:
-          # Меняем владельца файлов с root на текущего пользователя (runner)
+          # ВОТ ЭТО ИСПРАВЛЯЕТ ОШИБКУ 18:
           sudo chown -R $USER:$USER workspace/out
           
           cd workspace/out
+          # Проверяем файлы перед упаковкой
+          ls -lh
+          
           echo "Zipping..."
           zip -r1 ../${{ inputs.rom_name }}.zip ./*
           
@@ -117,8 +110,7 @@ jobs:
           tag_name: ${{ github.run_id }}
           name: ${{ inputs.rom_name }}
           body: |
-            GSI Port for POCO F3
-            Base: ${{ inputs.base_url }}
-            GSI: ${{ inputs.gsi_url }}
+            Automated GSI Port.
+            Source GSI: ${{ inputs.gsi_url }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
