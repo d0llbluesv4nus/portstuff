@@ -1,0 +1,163 @@
+name: POCO F3 ROM Porter (Universal)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: 'Ссылка на прошивку-ДОНОР (Source)'
+        required: true
+      base_url:
+        description: 'Ссылка на прошивку-БАЗУ (Vendor/Base)'
+        required: true
+      rom_name:
+        description: 'Имя файла на выходе'
+        required: true
+        default: 'Alioth_Port'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 🗑️ Clean Disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo docker image prune --all --force
+
+      - name: ⚙️ Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip curl wget python3 python3-pip android-sdk-libsparse-utils e2fsprogs f2fs-tools brotli
+          
+          # 1. Payload Dumper Go
+          wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          tar -zxf payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          sudo mv payload-dumper-go /usr/local/bin/
+          rm payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          
+          # 2. LPUNPACK (Для super.img)
+          wget -q -O lpunpack https://github.com/tekidoer/vendor_f2fs/raw/master/bin/lpunpack
+          chmod +x lpunpack
+          sudo mv lpunpack /usr/local/bin/
+          
+          # 3. sdat2img (Для старых DAT прошивок)
+          wget -q -O /usr/local/bin/sdat2img.py https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py
+          chmod +x /usr/local/bin/sdat2img.py
+
+      - name: 📥 Download & Extract (Universal)
+        run: |
+          mkdir -p workspace/source workspace/base
+          
+          # === ФУНКЦИЯ УНИВЕРСАЛЬНОЙ РАСПАКОВКИ ===
+          extract_rom() {
+              URL=$1
+              OUT_DIR=$2
+              ARCHIVE_NAME="rom_archive.zip"
+              
+              echo "Downloading $URL..."
+              wget -q -O $ARCHIVE_NAME "$URL"
+              
+              # Распаковка ZIP
+              unzip -q $ARCHIVE_NAME -d temp_extract || tar -xf $ARCHIVE_NAME -C temp_extract
+              rm $ARCHIVE_NAME
+              
+              cd temp_extract
+              
+              # СЦЕНАРИЙ A: Payload.bin
+              if [ -f "payload.bin" ]; then
+                  echo "Detected payload.bin"
+                  payload-dumper-go -o ../$OUT_DIR payload.bin
+                  
+              # СЦЕНАРИЙ B: Super.img
+              elif [ -n "$(find . -name 'super.img')" ]; then
+                  SUPER=$(find . -name 'super.img' | head -n 1)
+                  echo "Detected super.img at $SUPER"
+                  
+                  if file "$SUPER" | grep -q "sparse"; then
+                      echo "Converting sparse super..."
+                      simg2img "$SUPER" super.raw
+                      mv super.raw super.img
+                      SUPER="super.img"
+                  else
+                      mv "$SUPER" super.img
+                      SUPER="super.img"
+                  fi
+                  
+                  echo "Unpacking super.img..."
+                  lpunpack "$SUPER" ../$OUT_DIR
+                  
+              # СЦЕНАРИЙ C: Brotli (.new.dat.br)
+              elif [ -f "system.new.dat.br" ]; then
+                  echo "Detected Brotli DAT..."
+                  brotli --decompress system.new.dat.br
+                  python3 /usr/local/bin/sdat2img.py system.transfer.list system.new.dat ../$OUT_DIR/system.img
+                  # То же самое для vendor, если есть
+                  if [ -f "vendor.new.dat.br" ]; then
+                      brotli --decompress vendor.new.dat.br
+                      python3 /usr/local/bin/sdat2img.py vendor.transfer.list vendor.new.dat ../$OUT_DIR/vendor.img
+                  fi
+                  # Перемещаем boot image
+                  cp boot.img ../$OUT_DIR/ 2>/dev/null || true
+                  
+              else
+                  # СЦЕНАРИЙ D: Файлы лежат как есть (images)
+                  echo "Assuming raw images..."
+                  find . -name "*.img" -exec mv {} ../$OUT_DIR/ \;
+              fi
+              
+              cd ..
+              rm -rf temp_extract
+          }
+
+          # Запуск распаковки
+          echo ">>> PROCESSING SOURCE ROM <<<"
+          extract_rom "${{ inputs.source_url }}" "workspace/source"
+          
+          echo ">>> PROCESSING BASE ROM <<<"
+          extract_rom "${{ inputs.base_url }}" "workspace/base"
+
+      - name: 🛠️ Run Porting Script
+        run: |
+          if [ ! -f "port.sh" ]; then
+             echo "❌ Error: port.sh not found!"
+             exit 1
+          fi
+          chmod +x port.sh
+          # Запускаем от ROOT
+          sudo ./port.sh "$(pwd)/workspace/source" "$(pwd)/workspace/base"
+
+      - name: 🗜️ Pack & Release (Safe Mode)
+        run: |
+          echo "Fixing permissions (Solving Error 18)..."
+          # Возвращаем права пользователю runner
+          sudo chown -R $USER:$USER workspace/out
+          
+          cd workspace/out
+          echo "Listing files:"
+          ls -lh
+          
+          echo "Zipping..."
+          zip -r1 ../${{ inputs.rom_name }}.zip ./*
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: workspace/${{ inputs.rom_name }}.zip
+          tag_name: ${{ github.run_id }}
+          name: ${{ inputs.rom_name }}
+          body: |
+            Ported ROM for POCO F3 (Alioth)
+            Source: ${{ inputs.source_url }}
+            Base: ${{ inputs.base_url }}
+            
+            **Installation:**
+            1. Unzip the file.
+            2. Reboot to Fastboot.
+            3. Run `flash_rom.bat` (Windows) or `flash_rom.sh` (Linux).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
