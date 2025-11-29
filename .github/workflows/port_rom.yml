@@ -1,4 +1,4 @@
-name: POCO F3 ROM Porter (Universal)
+name: POCO F3 ROM Porter (Ultimate)
 
 on:
   workflow_dispatch:
@@ -21,12 +21,13 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout
+      - name: Checkout Repo
         uses: actions/checkout@v4
 
       - name: 🗑️ Clean Disk
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          # Освобождаем место удаляя ненужный софт
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
 
       - name: ⚙️ Install Tools
@@ -34,78 +35,105 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git zip unzip curl wget python3 python3-pip android-sdk-libsparse-utils e2fsprogs f2fs-tools brotli
           
-          # 1. Payload Dumper Go
+          # 1. Payload Dumper Go (для Recovery ROM)
           wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
           tar -zxf payload-dumper-go_1.2.2_linux_amd64.tar.gz
           sudo mv payload-dumper-go /usr/local/bin/
           rm payload-dumper-go_1.2.2_linux_amd64.tar.gz
           
-          # 2. LPUNPACK (Для super.img)
+          # 2. LPUNPACK (Для Fastboot ROM / super.img)
           wget -q -O lpunpack https://github.com/tekidoer/vendor_f2fs/raw/master/bin/lpunpack
           chmod +x lpunpack
           sudo mv lpunpack /usr/local/bin/
           
-          # 3. sdat2img (Для старых DAT прошивок)
+          # 3. sdat2img (Для старых форматов .dat.br)
           wget -q -O /usr/local/bin/sdat2img.py https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py
           chmod +x /usr/local/bin/sdat2img.py
 
-      - name: 📥 Download & Extract (Universal)
+      - name: 📥 Download & Extract (Smart Mode)
         run: |
           mkdir -p workspace/source workspace/base
           
-          # === ФУНКЦИЯ УНИВЕРСАЛЬНОЙ РАСПАКОВКИ ===
+          # === ФУНКЦИЯ УНИВЕРСАЛЬНОЙ ЗАГРУЗКИ И РАСПАКОВКИ ===
           extract_rom() {
               URL=$1
               OUT_DIR=$2
               ARCHIVE_NAME="rom_archive.zip"
               
-              echo "Downloading $URL..."
-              wget -q -O $ARCHIVE_NAME "$URL"
+              # --- ЛОГИКА ИСПРАВЛЕНИЯ ССЫЛОК ---
               
-              # Распаковка ZIP
-              unzip -q $ARCHIVE_NAME -d temp_extract || tar -xf $ARCHIVE_NAME -C temp_extract
+              # 1. PIXELDRAIN (Превращает /u/ в /api/file/)
+              if [[ "$URL" == *"pixeldrain.com"* ]] && [[ "$URL" == *"/u/"* ]]; then
+                  echo "Detected Pixeldrain. Converting to direct API link..."
+                  URL=${URL//\/u\//\/api\/file\/}
+              fi
+              
+              # 2. SOURCEFORGE (Добавляет /download если нет)
+              if [[ "$URL" == *"sourceforge.net"* ]]; then
+                  if [[ "$URL" != *"/download" ]]; then
+                      echo "Detected SourceForge. Adding /download suffix..."
+                      URL="${URL}/download"
+                  fi
+              fi
+              
+              echo "Downloading from: $URL"
+              
+              # Скачивание с маскировкой под браузер (User-Agent)
+              wget -U "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" --max-redirect=20 -q -O $ARCHIVE_NAME "$URL"
+              
+              # Проверка типа архива
+              if unzip -t $ARCHIVE_NAME >/dev/null 2>&1; then
+                  echo "Zip detected. Extracting..."
+                  unzip -q $ARCHIVE_NAME -d temp_extract
+              elif tar -tf $ARCHIVE_NAME >/dev/null 2>&1; then
+                   echo "Tar/Tgz detected. Extracting..."
+                   mkdir -p temp_extract
+                   tar -xf $ARCHIVE_NAME -C temp_extract
+              else
+                   echo "❌ ERROR: Download failed or file is not an archive!"
+                   rm $ARCHIVE_NAME
+                   exit 1
+              fi
               rm $ARCHIVE_NAME
               
+              # --- ЛОГИКА ПОИСКА ОБРАЗОВ ---
               cd temp_extract
               
-              # СЦЕНАРИЙ A: Payload.bin
+              # Сценарий A: Payload.bin
               if [ -f "payload.bin" ]; then
-                  echo "Detected payload.bin"
+                  echo "Found payload.bin"
                   payload-dumper-go -o ../$OUT_DIR payload.bin
                   
-              # СЦЕНАРИЙ B: Super.img
+              # Сценарий B: Super.img
               elif [ -n "$(find . -name 'super.img')" ]; then
                   SUPER=$(find . -name 'super.img' | head -n 1)
-                  echo "Detected super.img at $SUPER"
+                  echo "Found super.img at $SUPER"
                   
+                  # Конвертация Sparse -> Raw (если нужно)
                   if file "$SUPER" | grep -q "sparse"; then
-                      echo "Converting sparse super..."
-                      simg2img "$SUPER" super.raw
-                      mv super.raw super.img
-                      SUPER="super.img"
+                      echo "Desparsing super.img..."
+                      simg2img "$SUPER" super.raw; mv super.raw super.img; SUPER="super.img"
                   else
-                      mv "$SUPER" super.img
-                      SUPER="super.img"
+                      mv "$SUPER" super.img; SUPER="super.img"
                   fi
-                  
-                  echo "Unpacking super.img..."
+                  # Распаковка
                   lpunpack "$SUPER" ../$OUT_DIR
                   
-              # СЦЕНАРИЙ C: Brotli (.new.dat.br)
+              # Сценарий C: Brotli (.new.dat.br)
               elif [ -f "system.new.dat.br" ]; then
-                  echo "Detected Brotli DAT..."
+                  echo "Found Brotli DAT files"
                   brotli --decompress system.new.dat.br
                   python3 /usr/local/bin/sdat2img.py system.transfer.list system.new.dat ../$OUT_DIR/system.img
-                  # То же самое для vendor, если есть
+                  
                   if [ -f "vendor.new.dat.br" ]; then
                       brotli --decompress vendor.new.dat.br
                       python3 /usr/local/bin/sdat2img.py vendor.transfer.list vendor.new.dat ../$OUT_DIR/vendor.img
                   fi
-                  # Перемещаем boot image
-                  cp boot.img ../$OUT_DIR/ 2>/dev/null || true
+                  # Копируем Boot
+                  find . -name "boot.img" -exec cp {} ../$OUT_DIR/ \;
                   
               else
-                  # СЦЕНАРИЙ D: Файлы лежат как есть (images)
+                  # Сценарий D: Обычные образы
                   echo "Assuming raw images..."
                   find . -name "*.img" -exec mv {} ../$OUT_DIR/ \;
               fi
@@ -114,7 +142,7 @@ jobs:
               rm -rf temp_extract
           }
 
-          # Запуск распаковки
+          # ЗАПУСК РАСПАКОВКИ
           echo ">>> PROCESSING SOURCE ROM <<<"
           extract_rom "${{ inputs.source_url }}" "workspace/source"
           
@@ -124,21 +152,21 @@ jobs:
       - name: 🛠️ Run Porting Script
         run: |
           if [ ! -f "port.sh" ]; then
-             echo "❌ Error: port.sh not found!"
+             echo "❌ Error: port.sh is missing in the repository!"
              exit 1
           fi
           chmod +x port.sh
-          # Запускаем от ROOT
+          # Запуск от ROOT
           sudo ./port.sh "$(pwd)/workspace/source" "$(pwd)/workspace/base"
 
-      - name: 🗜️ Pack & Release (Safe Mode)
+      - name: 🗜️ Pack & Release (Fix Permissions)
         run: |
-          echo "Fixing permissions (Solving Error 18)..."
+          echo "Fixing file permissions (Solving Error 18)..."
           # Возвращаем права пользователю runner
           sudo chown -R $USER:$USER workspace/out
           
           cd workspace/out
-          echo "Listing files:"
+          echo "Files to zip:"
           ls -lh
           
           echo "Zipping..."
@@ -151,13 +179,11 @@ jobs:
           tag_name: ${{ github.run_id }}
           name: ${{ inputs.rom_name }}
           body: |
-            Ported ROM for POCO F3 (Alioth)
+            **Poco F3 Port**
             Source: ${{ inputs.source_url }}
             Base: ${{ inputs.base_url }}
             
             **Installation:**
-            1. Unzip the file.
-            2. Reboot to Fastboot.
-            3. Run `flash_rom.bat` (Windows) or `flash_rom.sh` (Linux).
+            Unzip and run `flash_rom.bat` in Fastboot mode.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
