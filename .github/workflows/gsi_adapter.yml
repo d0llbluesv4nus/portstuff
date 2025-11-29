@@ -1,16 +1,16 @@
-name: GSI Adapter for POCO F3
+name: GSI Adapter for POCO F3 (Final)
 
 on:
   workflow_dispatch:
     inputs:
       gsi_url:
-        description: 'Ссылка на GSI (img, xz, gz или zip)'
+        description: 'Direct Link to GSI (img, xz, gz, zip)'
         required: true
       base_url:
-        description: 'Ссылка на Base ROM (Vendor)'
+        description: 'Direct Link to Base ROM (Vendor)'
         required: true
       rom_name:
-        description: 'Имя релиза'
+        description: 'Release Name'
         required: true
         default: 'PocoF3_GSI_Mod'
 
@@ -26,55 +26,60 @@ jobs:
 
       - name: 🗑️ Disk Cleanup (Manual)
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          # Ручная очистка, так как сторонние actions могут быть удалены
+          echo "Cleaning up disk space..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
-          echo "Space available:"
+          echo "Disk space available:"
           df -h
 
       - name: ⚙️ Install Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y git zip unzip curl wget xz-utils android-sdk-libsparse-utils e2fsprogs
+          sudo apt-get install -y git zip unzip curl wget xz-utils android-sdk-libsparse-utils e2fsprogs f2fs-tools
           
-          # Payload Dumper для MIUI/Base ROM
+          # Установка payload-dumper-go
           wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
           tar -zxf payload-dumper-go_1.2.2_linux_amd64.tar.gz
           sudo mv payload-dumper-go /usr/local/bin/
+          rm payload-dumper-go_1.2.2_linux_amd64.tar.gz
 
       - name: 📥 Download & Extract
         run: |
           mkdir -p workspace/gsi workspace/base
           
-          # 1. Скачивание GSI
+          # --- GSI ---
           echo "Downloading GSI..."
           wget -q -O gsi_archive "${{ inputs.gsi_url }}"
           
-          # Определение типа архива и распаковка
           echo "Extracting GSI..."
+          # Обработка разных форматов архивов
           if [[ "${{ inputs.gsi_url }}" == *.xz ]]; then
             xz -d -c gsi_archive > workspace/gsi/system.img
           elif [[ "${{ inputs.gsi_url }}" == *.gz ]]; then
             gunzip -c gsi_archive > workspace/gsi/system.img
           elif [[ "${{ inputs.gsi_url }}" == *.zip ]]; then
             unzip -q gsi_archive -d workspace/gsi
-            # Ищем img внутри и переименовываем
             find workspace/gsi -name "*.img" -exec mv {} workspace/gsi/system.img \;
           else
             mv gsi_archive workspace/gsi/system.img
           fi
           rm -f gsi_archive
 
-          # 2. Скачивание Base ROM
+          # --- BASE ROM ---
           echo "Downloading Base..."
           wget -q -O base.zip "${{ inputs.base_url }}"
           unzip -q base.zip -d base_tmp
           rm base.zip
           
-          # Извлечение Vendor/Boot из Base
+          # Извлекаем Vendor и Boot
           if [ -f "base_tmp/payload.bin" ]; then
             payload-dumper-go -p vendor,boot,dtbo,vbmeta -o workspace/base base_tmp/payload.bin
           else
-            # Если это Fastboot ROM
+            # Если это Fastboot ROM (img файлы лежат в папке)
             find base_tmp -name "vendor.img" -exec mv {} workspace/base/ \;
             find base_tmp -name "boot.img" -exec mv {} workspace/base/ \;
             find base_tmp -name "dtbo.img" -exec mv {} workspace/base/ \;
@@ -84,12 +89,25 @@ jobs:
 
       - name: 🛠️ Run Adapter Script
         run: |
+          # Проверка наличия скрипта
+          if [ ! -f "adapter.sh" ]; then
+            echo "❌ Error: adapter.sh not found! Please create it in the repo."
+            exit 1
+          fi
+          
           chmod +x adapter.sh
+          # Запуск от root (создает файлы с правами root)
           sudo ./adapter.sh "$(pwd)/workspace/gsi" "$(pwd)/workspace/base"
 
-      - name: 🗜️ Pack & Release
+      - name: 🗜️ Pack & Release (Fixed Permissions)
         run: |
+          echo "Fixing permissions..."
+          # ВАЖНОЕ ИСПРАВЛЕНИЕ:
+          # Меняем владельца файлов с root на текущего пользователя (runner)
+          sudo chown -R $USER:$USER workspace/out
+          
           cd workspace/out
+          echo "Zipping..."
           zip -r1 ../${{ inputs.rom_name }}.zip ./*
           
       - name: Upload Release
@@ -98,5 +116,9 @@ jobs:
           files: workspace/${{ inputs.rom_name }}.zip
           tag_name: ${{ github.run_id }}
           name: ${{ inputs.rom_name }}
+          body: |
+            GSI Port for POCO F3
+            Base: ${{ inputs.base_url }}
+            GSI: ${{ inputs.gsi_url }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
