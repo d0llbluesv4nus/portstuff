@@ -1,168 +1,159 @@
 #!/bin/bash
 
 GSI_URL=$1
-BOOT_URL=$2
-ROM_NAME=$3
+ROM_NAME=$2
 
 WORK_DIR=$(pwd)/build
 INPUT_DIR=$WORK_DIR/input
 MOUNT_POINT=$WORK_DIR/system_mount
 OUTPUT_DIR=$WORK_DIR/output
-TOOLS_DIR=$(pwd)/bin
 
-mkdir -p $INPUT_DIR $MOUNT_POINT $OUTPUT_DIR $TOOLS_DIR
+mkdir -p $INPUT_DIR $MOUNT_POINT $OUTPUT_DIR
 
 echo "=========================================="
-echo "Starting GSI Patching for Poco F3"
-echo "GSI: $GSI_URL"
+echo "Starting GSI System Patching"
+echo "Target Device: Poco F3 (Alioth)"
+echo "Source GSI: $GSI_URL"
 echo "=========================================="
 
-# --- 0. Подготовка инструментов (Magiskboot) ---
-if [ ! -f "$TOOLS_DIR/magiskboot" ]; then
-    echo "[!] Downloading Magiskboot..."
-    wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz -O temp_pd.tar.gz
-    # Для простоты используем готовую сборку magiskboot с GitHub (пример)
-    wget https://raw.githubusercontent.com/yshalsager/magiskboot_build_script/master/magiskboot -O "$TOOLS_DIR/magiskboot"
-    chmod +x "$TOOLS_DIR/magiskboot"
-fi
-export PATH=$TOOLS_DIR:$PATH
-
-# --- 1. Скачивание файлов ---
+# --- 1. Скачивание GSI ---
 echo "[+] Downloading GSI..."
+# Используем axel для скорости, fallback на wget
 axel -n 16 -o "$INPUT_DIR/system_archive" "$GSI_URL" || wget -O "$INPUT_DIR/system_archive" "$GSI_URL"
 
-echo "[+] Downloading Boot image..."
-wget -O "$INPUT_DIR/boot.img" "$BOOT_URL"
-
-# --- 2. Распаковка GSI ---
-echo "[+] Extracting GSI..."
+# --- 2. Распаковка и подготовка образа ---
 cd "$INPUT_DIR"
-# Проверка типа архива
+echo "[+] Extracting GSI..."
+
 if [[ "$GSI_URL" == *.xz ]]; then
     xz -d -c system_archive > system.img
 elif [[ "$GSI_URL" == *.zip ]]; then
     unzip system_archive
-    # Ищем system.img внутри
+    # Ищем system.img, так как в ZIP он может называться по-разному
     find . -name "system.img" -exec mv {} . \;
 else
     mv system_archive system.img
 fi
 
-# Проверка, является ли образ sparse, и конвертация в raw
+# Если файл не назвался system.img (например, system-arm64-ab.img), переименуем
+if [ ! -f system.img ]; then
+    find . -maxdepth 1 -name "*.img" -head 1 -exec mv {} system.img \;
+fi
+
+# Проверка на Sparse формат (если образ сжат для прошивки)
 if file system.img | grep -q "sparse"; then
     echo "[+] Converting Sparse to Raw..."
     simg2img system.img system_raw.img
     mv system_raw.img system.img
 fi
 
-# --- 3. Работа с System (Конвертация и Патчинг) ---
-echo "[+] Checking filesystem type..."
+# --- 3. Конвертация EROFS -> EXT4 (если нужно) ---
+# Большинство Android 13/14 GSI идут в EROFS (Read-Only). Нам нужен EXT4 (Read-Write).
 FS_TYPE=$(file -sL system.img | grep -oE 'ext4|erofs')
+echo "[+] Filesystem detected: $FS_TYPE"
 
 if [ "$FS_TYPE" == "erofs" ]; then
-    echo "[!] EROFS detected. Extracting and converting to EXT4 for modification..."
-    # EROFS - только чтение. Нужно распаковать и создать новый EXT4 образ.
+    echo "[!] Converting EROFS to EXT4 for modding..."
+    # Распаковываем EROFS
     extract.erofs -i system.img -x
-    # Теперь файлы в папке "extract" (или аналогичной, зависит от версии утилиты, часто это просто корень)
-    # Предположим extract.erofs распаковал в ./system
-    # Если extract.erofs не сработал как надо (зависит от версии), используем mount
-    mkdir -p raw_system
-    extract.erofs -i system.img -o raw_system
     
-    # Создаем новый ext4 образ нужного размера (например 4Гб)
-    make_ext4fs -s -l 4096M -a system new_system.img raw_system/
+    # Ищем, куда распаковалось (обычно папка extract или корень)
+    # Предполагаем, что rootfs лежит в текущей директории, если extract.erofs так настроен
+    # Но для надежности создадим структуру
+    if [ -d "extract" ]; then
+        SOURCE_DIR="extract"
+    else
+        # Если старая версия утилиты распаковала в корень
+        mkdir -p extracted_root
+        extract.erofs -i system.img -o extracted_root
+        SOURCE_DIR="extracted_root"
+    fi
+    
+    # Создаем EXT4 образ с запасом места (например, 4.5ГБ)
+    make_ext4fs -s -l 4608M -a system new_system.img "$SOURCE_DIR/"
     mv new_system.img system.img
-    
-    # Чистим
-    rm -rf raw_system
+    rm -rf "$SOURCE_DIR"
+elif [ "$FS_TYPE" == "ext4" ]; then
+    # Если уже ext4, просто увеличиваем размер, чтобы влезли патчи
+    e2fsck -f -y system.img
+    resize2fs system.img 5000M
 fi
 
-echo "[+] Mounting System..."
+# --- 4. Монтирование ---
+echo "[+] Mounting System Image..."
 sudo mount -o loop,rw system.img "$MOUNT_POINT"
 
-# === ПАТЧИНГ SYSTEM ===
+# --- 5. Внесение изменений (ПАТЧИНГ) ---
 
-echo "[*] Enabling USB Debugging (ADB)..."
-# Добавляем свойства в build.prop (или system/build.prop)
+# A. Включение USB Debugging (ADB)
+echo "[*] Enabling ADB in build.prop..."
+# Файл может лежать в system/build.prop или в корне (system-as-root)
 PROP_FILE="$MOUNT_POINT/system/build.prop"
 if [ ! -f "$PROP_FILE" ]; then PROP_FILE="$MOUNT_POINT/build.prop"; fi
 
-sudo bash -c "echo '' >> $PROP_FILE"
-sudo bash -c "echo '# Enable ADB' >> $PROP_FILE"
-sudo bash -c "echo 'persist.sys.usb.config=mtp,adb' >> $PROP_FILE"
-sudo bash -c "echo 'ro.adb.secure=0' >> $PROP_FILE"
-sudo bash -c "echo 'ro.debuggable=1' >> $PROP_FILE"
-sudo bash -c "echo 'service.adb.root=1' >> $PROP_FILE"
-
-echo "[*] Applying Overlays (Poco F3 specific)..."
-# Копируем оверлеи из папки репозитория (если они есть)
-if [ -d "$(pwd)/../../patches/overlays" ]; then
-    OVERLAY_DIR="$MOUNT_POINT/system/product/overlay"
-    sudo mkdir -p "$OVERLAY_DIR"
-    sudo cp -r $(pwd)/../../patches/overlays/* "$OVERLAY_DIR/"
-    echo "[+] Overlays copied."
+if [ -f "$PROP_FILE" ]; then
+    sudo bash -c "echo '' >> $PROP_FILE"
+    sudo bash -c "echo '# MODS BY GITHUB ACTIONS' >> $PROP_FILE"
+    # Принудительное включение отладки
+    sudo bash -c "echo 'persist.sys.usb.config=mtp,adb' >> $PROP_FILE"
+    sudo bash -c "echo 'ro.adb.secure=0' >> $PROP_FILE"
+    sudo bash -c "echo 'ro.debuggable=1' >> $PROP_FILE"
+    sudo bash -c "echo 'service.adb.root=1' >> $PROP_FILE"
+    
+    # Спуфинг (опционально, чтобы проходить SafetyNet базово)
+    # sudo sed -i 's/ro.build.type=userdebug/ro.build.type=user/' $PROP_FILE
 else
-    echo "[!] No overlays found in patches/overlays/"
+    echo "[!] Warning: build.prop not found!"
 fi
 
-echo "[*] Patching Fstab (Generic)..."
-# Обычно в GSI fstab лежит в boot, но иногда есть и в system/etc
-# Удаляем шифрование или verity, если нужно (пример)
-# sudo sed -i 's/fileencryption=//g' "$MOUNT_POINT/system/etc/fstab*" 2>/dev/null || true
+# B. Установка Оверлеев (Poco F3 Overlays)
+echo "[*] Injecting Overlays..."
+OVERLAY_SOURCE="$(pwd)/../../patches/overlays"
+OVERLAY_TARGET="$MOUNT_POINT/system/product/overlay"
 
-# Размонтирование
+if [ -d "$OVERLAY_SOURCE" ]; then
+    # Создаем папку, если её нет
+    sudo mkdir -p "$OVERLAY_TARGET"
+    sudo cp -r "$OVERLAY_SOURCE"/* "$OVERLAY_TARGET/"
+    
+    # Выставляем права 644
+    sudo chmod 644 "$OVERLAY_TARGET"/*.apk 2>/dev/null || true
+    echo "[+] Overlays installed."
+else
+    echo "[!] No overlays found in repository (patches/overlays). Skipping."
+fi
+
+# C. Патчинг Fstab (В GSI fstab часто находится в /system/etc/)
+echo "[*] Patching fstab inside system (if exists)..."
+# Ищем файлы fstab
+FSTAB_FILES=$(find "$MOUNT_POINT/system/etc" -name "fstab*")
+for f in $FSTAB_FILES; do
+    echo "   -> Patching $f"
+    # Убираем forceencrypt или fileencryption, меняем на encryptable (опционально)
+    # sudo sed -i 's/fileencryption=/encryptable=/' "$f"
+    
+    # Часто нужно убрать verify (AVB) чтобы система загрузилась с изменениями
+    sudo sed -i 's/,verify//g' "$f"
+    sudo sed -i 's/,avb=[^,]*//g' "$f"
+done
+
+# D. Phh / Treble Settings (Если это Phh-based GSI)
+# Иногда нужно создать флаг-файлы, чтобы активировать фиксы для Xiaomi
+# Пример: включение альтернативного режима подсветки, если нужно
+# sudo touch "$MOUNT_POINT/system/phh/xiaomi-new-brightness-scale"
+
+# --- 6. Завершение ---
+echo "[+] Unmounting and shrinking..."
 sudo umount "$MOUNT_POINT"
 
-# Уменьшение размера образа ext4 до минимального
+# Уменьшаем размер образа до минимально возможного, чтобы ZIP был меньше
 e2fsck -f -y system.img
 resize2fs -M system.img
 
-# --- 4. Работа с Boot (Patcher) ---
-echo "[+] Patching Boot Image..."
-cd "$INPUT_DIR"
-mkdir boot_work
-cp boot.img boot_work/
-cd boot_work
-
-# Распаковка boot
-"$TOOLS_DIR/magiskboot" unpack boot.img
-
-echo "[*] Editing Ramdisk properties..."
-# Если cpio распакован успешно (обычно ramdisk.cpio)
-"$TOOLS_DIR/magiskboot" cpio ramdisk.cpio extract
-
-# Включение отладки в default.prop (находится в корне ramdisk)
-if [ -f "default.prop" ]; then
-    sed -i 's/ro.adb.secure=1/ro.adb.secure=0/' default.prop
-    sed -i 's/ro.debuggable=0/ro.debuggable=1/' default.prop
-    echo "persist.sys.usb.config=mtp,adb" >> default.prop
-fi
-
-# Патчинг fstab в ramdisk (если он там есть)
-# Alioth использует system-as-root, поэтому основной fstab часто в vendor, 
-# но ранний fstab в ramdisk. Удаляем проверку vbmeta.
-for f in fstab.*; do
-    [ -e "$f" ] || continue
-    sed -i 's/,avb_keys=[^,]*//g' "$f"
-    sed -i 's/,avb=[^,]*//g' "$f"
-    sed -i 's/,verify//g' "$f"
-done
-
-# Запаковка ramdisk обратно
-"$TOOLS_DIR/magiskboot" cpio ramdisk.cpio patch
-"$TOOLS_DIR/magiskboot" cpio ramdisk.cpio repack "ramdisk_new.cpio"
-mv ramdisk_new.cpio ramdisk.cpio
-
-echo "[*] Repacking Boot..."
-"$TOOLS_DIR/magiskboot" repack boot.img
-mv new-boot.img ../patched_boot.img
-cd ..
-
-# --- 5. Финальная упаковка ---
-echo "[+] Zipping final ROM..."
+echo "[+] Zipping Result..."
 mv system.img system_patched.img
-zip -r "$OUTPUT_DIR/${ROM_NAME}.zip" system_patched.img patched_boot.img
+zip -r "$OUTPUT_DIR/${ROM_NAME}.zip" system_patched.img
 
 echo "=========================================="
-echo "Done! Output: $OUTPUT_DIR/${ROM_NAME}.zip"
+echo "Done! File saved to artifacts."
 echo "=========================================="
