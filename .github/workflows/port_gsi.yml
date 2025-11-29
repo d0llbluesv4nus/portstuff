@@ -1,21 +1,18 @@
-name: GSI Patcher for Poco F3
+name: GSI System Patcher (No Boot)
 
 on:
   workflow_dispatch:
     inputs:
       gsi_url:
-        description: 'Прямая ссылка на GSI (system.img.xz или system.img)'
-        required: true
-      boot_url:
-        description: 'Ссылка на boot.img (от стока или кастома Alioth) для патчинга'
+        description: 'Прямая ссылка на GSI (system.img.xz или zip)'
         required: true
       rom_name:
         description: 'Имя выходного архива'
         required: true
-        default: 'PocoF3_GSI_Patched'
+        default: 'PocoF3_GSI_SystemOnly'
 
 jobs:
-  port:
+  patch:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -39,17 +36,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git wget unzip zip tar axel python3 android-sdk-libsparse-utils e2fsprogs simg2img
           
-          # Установка инструментов для EROFS (если GSI в новом формате)
+          # Инструменты для работы с EROFS (чтение/распаковка)
           sudo apt-get install -y erofs-utils
-          
-          # Делаем скрипты исполняемыми
+
           chmod +x scripts/process.sh
-          # Если вы добавили magiskboot в репозиторий:
-          # chmod +x bin/magiskboot
 
       - name: Run Patcher Script
         run: |
-          sudo bash scripts/process.sh "${{ github.event.inputs.gsi_url }}" "${{ github.event.inputs.boot_url }}" "${{ github.event.inputs.rom_name }}"
+          sudo bash scripts/process.sh "${{ github.event.inputs.gsi_url }}" "${{ github.event.inputs.rom_name }}"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
