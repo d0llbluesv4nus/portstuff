@@ -1,4 +1,4 @@
-name: POCO F3 ROM Porter (Ultimate)
+name: POCO F3 ROM Porter (Final Fix)
 
 on:
   workflow_dispatch:
@@ -26,27 +26,32 @@ jobs:
 
       - name: 🗑️ Clean Disk
         run: |
-          # Освобождаем место удаляя ненужный софт
+          # Ручная очистка места
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
 
-      - name: ⚙️ Install Tools
+      - name: ⚙️ Install Tools (Fixed Exit Code 8)
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
+          # 1. Отключаем интерактивный режим needrestart (чтобы не было ошибки Exit code 8)
+          sudo sed -i 's/#$nrconf{restart} = '"'"'i'"'"';/$nrconf{restart} = '"'"'a'"'"';/g' /etc/needrestart/needrestart.conf
+          
           sudo apt-get update
           sudo apt-get install -y git zip unzip curl wget python3 python3-pip android-sdk-libsparse-utils e2fsprogs f2fs-tools brotli
           
-          # 1. Payload Dumper Go (для Recovery ROM)
+          # 2. Payload Dumper Go
           wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
           tar -zxf payload-dumper-go_1.2.2_linux_amd64.tar.gz
           sudo mv payload-dumper-go /usr/local/bin/
           rm payload-dumper-go_1.2.2_linux_amd64.tar.gz
           
-          # 2. LPUNPACK (Для Fastboot ROM / super.img)
+          # 3. LPUNPACK
           wget -q -O lpunpack https://github.com/tekidoer/vendor_f2fs/raw/master/bin/lpunpack
           chmod +x lpunpack
           sudo mv lpunpack /usr/local/bin/
           
-          # 3. sdat2img (Для старых форматов .dat.br)
+          # 4. sdat2img
           wget -q -O /usr/local/bin/sdat2img.py https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py
           chmod +x /usr/local/bin/sdat2img.py
 
@@ -62,26 +67,26 @@ jobs:
               
               # --- ЛОГИКА ИСПРАВЛЕНИЯ ССЫЛОК ---
               
-              # 1. PIXELDRAIN (Превращает /u/ в /api/file/)
+              # PIXELDRAIN
               if [[ "$URL" == *"pixeldrain.com"* ]] && [[ "$URL" == *"/u/"* ]]; then
-                  echo "Detected Pixeldrain. Converting to direct API link..."
+                  echo "Detected Pixeldrain. Converting link..."
                   URL=${URL//\/u\//\/api\/file\/}
               fi
               
-              # 2. SOURCEFORGE (Добавляет /download если нет)
+              # SOURCEFORGE
               if [[ "$URL" == *"sourceforge.net"* ]]; then
                   if [[ "$URL" != *"/download" ]]; then
-                      echo "Detected SourceForge. Adding /download suffix..."
+                      echo "Detected SourceForge. Adding suffix..."
                       URL="${URL}/download"
                   fi
               fi
               
               echo "Downloading from: $URL"
               
-              # Скачивание с маскировкой под браузер (User-Agent)
+              # Скачивание (User-Agent для обхода защиты)
               wget -U "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" --max-redirect=20 -q -O $ARCHIVE_NAME "$URL"
               
-              # Проверка типа архива
+              # Проверка архива
               if unzip -t $ARCHIVE_NAME >/dev/null 2>&1; then
                   echo "Zip detected. Extracting..."
                   unzip -q $ARCHIVE_NAME -d temp_extract
@@ -90,7 +95,7 @@ jobs:
                    mkdir -p temp_extract
                    tar -xf $ARCHIVE_NAME -C temp_extract
               else
-                   echo "❌ ERROR: Download failed or file is not an archive!"
+                   echo "❌ ERROR: Download failed or invalid archive!"
                    rm $ARCHIVE_NAME
                    exit 1
               fi
@@ -99,27 +104,25 @@ jobs:
               # --- ЛОГИКА ПОИСКА ОБРАЗОВ ---
               cd temp_extract
               
-              # Сценарий A: Payload.bin
+              # A: Payload.bin
               if [ -f "payload.bin" ]; then
                   echo "Found payload.bin"
                   payload-dumper-go -o ../$OUT_DIR payload.bin
                   
-              # Сценарий B: Super.img
+              # B: Super.img
               elif [ -n "$(find . -name 'super.img')" ]; then
                   SUPER=$(find . -name 'super.img' | head -n 1)
                   echo "Found super.img at $SUPER"
                   
-                  # Конвертация Sparse -> Raw (если нужно)
                   if file "$SUPER" | grep -q "sparse"; then
                       echo "Desparsing super.img..."
                       simg2img "$SUPER" super.raw; mv super.raw super.img; SUPER="super.img"
                   else
                       mv "$SUPER" super.img; SUPER="super.img"
                   fi
-                  # Распаковка
                   lpunpack "$SUPER" ../$OUT_DIR
                   
-              # Сценарий C: Brotli (.new.dat.br)
+              # C: Brotli (.new.dat.br)
               elif [ -f "system.new.dat.br" ]; then
                   echo "Found Brotli DAT files"
                   brotli --decompress system.new.dat.br
@@ -129,11 +132,10 @@ jobs:
                       brotli --decompress vendor.new.dat.br
                       python3 /usr/local/bin/sdat2img.py vendor.transfer.list vendor.new.dat ../$OUT_DIR/vendor.img
                   fi
-                  # Копируем Boot
                   find . -name "boot.img" -exec cp {} ../$OUT_DIR/ \;
                   
               else
-                  # Сценарий D: Обычные образы
+                  # D: Raw Images
                   echo "Assuming raw images..."
                   find . -name "*.img" -exec mv {} ../$OUT_DIR/ \;
               fi
@@ -152,7 +154,7 @@ jobs:
       - name: 🛠️ Run Porting Script
         run: |
           if [ ! -f "port.sh" ]; then
-             echo "❌ Error: port.sh is missing in the repository!"
+             echo "❌ Error: port.sh missing!"
              exit 1
           fi
           chmod +x port.sh
@@ -161,14 +163,11 @@ jobs:
 
       - name: 🗜️ Pack & Release (Fix Permissions)
         run: |
-          echo "Fixing file permissions (Solving Error 18)..."
-          # Возвращаем права пользователю runner
+          echo "Fixing file permissions..."
+          # Исправление ошибки Permission Denied (Error 18)
           sudo chown -R $USER:$USER workspace/out
           
           cd workspace/out
-          echo "Files to zip:"
-          ls -lh
-          
           echo "Zipping..."
           zip -r1 ../${{ inputs.rom_name }}.zip ./*
 
